@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="vi">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YTFlash</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+
+<body>
+  <main class="container">
+    <h1>⚡ YTFlash</h1>
+    <p class="subtitle">Tải video YouTube / TikTok / Instagram / Facebook / ...</p>
+
+    <div class="row">
+      <input id="url" type="text" placeholder="Dán link video vào đây..." />
+      <button id="fetch-btn">Kiểm tra</button>
+    </div>
+
+    <div id="info-card" class="info-card hidden">
+      <img id="info-thumb" src="" alt="" />
+      <div class="info-text">
+        <div id="info-title" class="info-title"></div>
+        <div id="info-meta" class="info-meta"></div>
+        <div id="info-playlist" class="info-playlist hidden">
+          📃 Đây là một playlist (<span id="playlist-count"></span> video)
+          <label><input type="checkbox" id="playlist-toggle" /> Tải cả playlist</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="row options">
+      <label class="field">
+        <span>Chất lượng</span>
+        <select id="quality-select">
+          <option value="best">Tốt nhất (mp4)</option>
+          <option value="audio">Chỉ âm thanh (mp3)</option>
+        </select>
+      </label>
+      <button id="choose-dir-btn">Chọn thư mục lưu</button>
+      <span id="out-dir" class="out-dir"></span>
+    </div>
+
+    <div class="row">
+      <label class="field grow">
+        <span>Mẫu tên file (nâng cao, cú pháp yt-dlp output template)</span>
+        <input id="filename-template" type="text" placeholder="%(title).150B [%(id)s].%(ext)s" />
+      </label>
+    </div>
+
+    <div class="row">
+      <button id="add-queue-btn" disabled>➕ Thêm vào hàng đợi</button>
+      <button id="download-btn" disabled>Tải ngay</button>
+    </div>
+
+    <section class="queue-section">
+      <div class="queue-header">
+        <h2>Hàng đợi tải</h2>
+        <button id="start-queue-btn" disabled>▶ Tải tất cả</button>
+      </div>
+      <ul id="queue-list" class="queue-list"></ul>
+    </section>
+
+    <div id="status" class="status"></div>
+  </main>
+  <script type="module" src="/main.js"></script>
+</body>
+
+</html>
