@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -22,13 +22,25 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[derive(Default)]
 pub struct DownloadRegistry(pub Mutex<HashMap<String, Child>>);
 
-/// Tìm binary theo thứ tự ưu tiên: cạnh exe của app (bundled) -> PATH hệ thống.
-fn resolve_binary(name: &str) -> Result<PathBuf, String> {
+/// Tìm binary theo thứ tự ưu tiên:
+/// 1. Resource dir của bản build đã đóng gói (binaries/<name>.exe, khai báo trong tauri.conf.json)
+/// 2. Cạnh exe của app (tiện cho dev: đặt thủ công vào target/debug)
+/// 3. PATH hệ thống
+fn resolve_binary(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     let exe_name = if cfg!(windows) {
         format!("{name}.exe")
     } else {
         name.to_string()
     };
+
+    if let Ok(path) = app
+        .path()
+        .resolve(format!("binaries/{exe_name}"), BaseDirectory::Resource)
+    {
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
 
     if let Ok(exe_dir) = std::env::current_exe() {
         if let Some(dir) = exe_dir.parent() {
@@ -36,7 +48,6 @@ fn resolve_binary(name: &str) -> Result<PathBuf, String> {
             if candidate.is_file() {
                 return Ok(candidate);
             }
-            // Tauri sidecar convention (resources) as fallback location.
             let candidate = dir.join("binaries").join(&exe_name);
             if candidate.is_file() {
                 return Ok(candidate);
@@ -99,9 +110,9 @@ where
 }
 
 #[tauri::command]
-pub async fn check_yt_dlp() -> Result<String, String> {
-    run_blocking(|| {
-        let bin = resolve_binary("yt-dlp")?;
+pub async fn check_yt_dlp(app: AppHandle) -> Result<String, String> {
+    run_blocking(move || {
+        let bin = resolve_binary(&app, "yt-dlp")?;
         let out = base_command(&bin)
             .arg("--version")
             .output()
@@ -148,8 +159,8 @@ fn detect_playlist(bin: &PathBuf, url: &str) -> (bool, Option<i64>) {
 }
 
 #[tauri::command]
-pub async fn fetch_info(url: String) -> Result<VideoInfo, String> {
-    let bin = run_blocking(|| resolve_binary("yt-dlp")).await?;
+pub async fn fetch_info(app: AppHandle, url: String) -> Result<VideoInfo, String> {
+    let bin = run_blocking(move || resolve_binary(&app, "yt-dlp")).await?;
 
     // Hai lệnh yt-dlp (metadata single-video + dò playlist) chạy song song
     // trên 2 thread riêng thay vì tuần tự, để giảm ~50% thời gian chờ mạng.
@@ -261,7 +272,8 @@ fn run_download_blocking(
     is_playlist: bool,
     filename_template: Option<String>,
 ) -> Result<(), String> {
-    let bin = resolve_binary("yt-dlp")?;
+    let bin = resolve_binary(&app, "yt-dlp")?;
+    let ffmpeg_path = resolve_binary(&app, "ffmpeg").ok();
     let registry = app.state::<DownloadRegistry>();
 
     let template = filename_template
@@ -277,6 +289,13 @@ fn run_download_blocking(
 
     let mut cmd = base_command(&bin);
     cmd.args(["--newline", "--no-warnings", "-o", &out_template]);
+
+    if let Some(ffmpeg) = &ffmpeg_path {
+        // Chỉ cần khi ffmpeg không có sẵn trong PATH của máy người dùng —
+        // trỏ thẳng tới bản đã bundle cùng app để mux mp4 hoạt động độc lập.
+        cmd.arg("--ffmpeg-location");
+        cmd.arg(ffmpeg);
+    }
 
     if is_playlist {
         cmd.arg("--yes-playlist");
