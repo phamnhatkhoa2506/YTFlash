@@ -9,61 +9,140 @@
 </head>
 
 <body>
-  <main class="container">
-    <h1>⚡ YTFlash</h1>
-    <p class="subtitle">Tải video YouTube / TikTok / Instagram / Facebook / ...</p>
-
-    <div class="row">
-      <input id="url" type="text" placeholder="Dán link video vào đây..." />
-      <button id="fetch-btn">Kiểm tra</button>
-    </div>
-
-    <div id="info-card" class="info-card hidden">
-      <img id="info-thumb" src="" alt="" />
-      <div class="info-text">
-        <div id="info-title" class="info-title"></div>
-        <div id="info-meta" class="info-meta"></div>
-        <div id="info-playlist" class="info-playlist hidden">
-          📃 Đây là một playlist (<span id="playlist-count"></span> video)
-          <label><input type="checkbox" id="playlist-toggle" /> Tải cả playlist</label>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" fill="none">
+            <rect width="32" height="32" rx="9" fill="currentColor" />
+            <path d="M17.4 6.2 9.6 17.1h5.6l-1.15 8.7 8.35-11.5h-5.7L17.4 6.2Z" fill="#1a1408" />
+          </svg>
+        </div>
+        <div class="brand-copy">
+          <h1>YTFlash</h1>
+          <p>Tải video từ YouTube, TikTok, Instagram, Facebook</p>
         </div>
       </div>
+      <button id="update-dlp-btn" class="btn ghost mini" type="button"
+        title="Cập nhật yt-dlp để vượt qua thay đổi chống bot của YouTube">
+        Cập nhật yt-dlp
+      </button>
+    </header>
+
+    <div class="workspace">
+      <section class="panel composer" aria-label="Tải video">
+        <div class="url-bar">
+          <label class="sr-only" for="url">Liên kết video</label>
+          <input id="url" type="text" placeholder="Dán liên kết video vào đây…" autocomplete="off" spellcheck="false" />
+          <button id="fetch-btn" class="btn primary" type="button">Kiểm tra</button>
+        </div>
+
+        <article id="info-card" class="info-card hidden">
+          <img id="info-thumb" src="" alt="" />
+          <div class="info-text">
+            <div id="info-title" class="info-title"></div>
+            <div id="info-meta" class="info-meta"></div>
+            <div id="info-playlist" class="info-playlist hidden">
+              <span class="playlist-note">Playlist · <span id="playlist-count"></span> video</span>
+              <label class="switch">
+                <input type="checkbox" id="playlist-toggle" />
+                <span>Tải cả playlist</span>
+              </label>
+            </div>
+          </div>
+        </article>
+
+        <div class="preview-placeholder">
+          <div class="frame" aria-hidden="true"></div>
+          <div>
+            <strong>Chưa có video</strong>
+            <p>Dán liên kết và bấm Kiểm tra để xem tiêu đề, thời lượng và chất lượng.</p>
+          </div>
+        </div>
+
+        <div class="settings-grid">
+          <label class="field">
+            <span>Chất lượng</span>
+            <select id="quality-select">
+              <option value="best">Tốt nhất (mp4)</option>
+              <option value="audio">Chỉ âm thanh (mp3)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Cookies trình duyệt</span>
+            <select id="browser-select"
+              title="YouTube/TikTok có thể yêu cầu đăng nhập — chọn trình duyệt bạn đã đăng nhập để mượn cookies">
+              <option value="">Không dùng</option>
+              <option value="chrome">Chrome</option>
+              <option value="edge">Edge</option>
+              <option value="firefox">Firefox</option>
+              <option value="brave">Brave</option>
+              <option value="vivaldi">Vivaldi</option>
+              <option value="opera">Opera</option>
+            </select>
+          </label>
+          <div class="field">
+            <span>File cookies</span>
+            <button id="choose-cookies-btn" class="btn ghost" type="button"
+              title="File cookies.txt (Netscape) xuất từ trình duyệt — cách chắc chắn khi Chrome/Edge lỗi DPAPI">
+              Chọn cookies.txt
+            </button>
+            <span id="cookies-file" class="path-chip"></span>
+          </div>
+          <div class="field">
+            <span>Thư mục lưu</span>
+            <button id="choose-dir-btn" class="btn ghost" type="button">Chọn thư mục</button>
+            <span id="out-dir" class="path-chip"></span>
+          </div>
+          <label class="field span-2">
+            <span>Mẫu tên file</span>
+            <input id="filename-template" type="text" placeholder="%(title).150B [%(id)s].%(ext)s"
+              spellcheck="false" />
+          </label>
+          <label class="field">
+            <span>Dải video playlist <em
+                style="font-style: normal; opacity: 0.75;">(yt-dlp)</em></span>
+            <input id="playlist-items" type="text" placeholder="1-5, 8, 12- (trống = tải tất cả)"
+              spellcheck="false" />
+          </label>
+          <div class="field span-2">
+            <span>Tuỳ chọn yt-dlp</span>
+            <div class="check-row">
+              <label class="check"><input type="checkbox" id="opt-subs" /> Phụ đề vi/en</label>
+              <label class="check"><input type="checkbox" id="opt-subs-embed" disabled /> Ghép phụ đề vào video</label>
+              <label class="check"><input type="checkbox" id="opt-embed" /> Nhúng thumbnail + metadata</label>
+              <label class="check"><input type="checkbox" id="opt-archive" /> Bỏ qua video đã tải</label>
+            </div>
+          </div>
+        </div>
+
+        <div class="action-row">
+          <button id="add-queue-btn" class="btn ghost" type="button" disabled>Thêm vào hàng đợi</button>
+          <button id="download-btn" class="btn primary" type="button" disabled>Tải ngay</button>
+        </div>
+      </section>
+
+      <aside class="panel queue-panel" aria-label="Hàng đợi tải">
+        <div class="queue-header">
+          <div>
+            <h2>Hàng đợi <span id="queue-count" class="count">0</span></h2>
+            <p>Tải lần lượt. Có thể hủy từng mục đang chạy.</p>
+          </div>
+          <button id="start-queue-btn" class="btn primary" type="button" disabled>Tải tất cả</button>
+        </div>
+        <div id="queue-empty" class="queue-empty">
+          <span class="empty-mark" aria-hidden="true"></span>
+          <p>Hàng đợi đang trống. Kiểm tra một liên kết rồi thêm vào đây.</p>
+        </div>
+        <ul id="queue-list" class="queue-list"></ul>
+      </aside>
     </div>
 
-    <div class="row options">
-      <label class="field">
-        <span>Chất lượng</span>
-        <select id="quality-select">
-          <option value="best">Tốt nhất (mp4)</option>
-          <option value="audio">Chỉ âm thanh (mp3)</option>
-        </select>
-      </label>
-      <button id="choose-dir-btn">Chọn thư mục lưu</button>
-      <span id="out-dir" class="out-dir"></span>
-    </div>
-
-    <div class="row">
-      <label class="field grow">
-        <span>Mẫu tên file (nâng cao, cú pháp yt-dlp output template)</span>
-        <input id="filename-template" type="text" placeholder="%(title).150B [%(id)s].%(ext)s" />
-      </label>
-    </div>
-
-    <div class="row">
-      <button id="add-queue-btn" disabled>➕ Thêm vào hàng đợi</button>
-      <button id="download-btn" disabled>Tải ngay</button>
-    </div>
-
-    <section class="queue-section">
-      <div class="queue-header">
-        <h2>Hàng đợi tải</h2>
-        <button id="start-queue-btn" disabled>▶ Tải tất cả</button>
-      </div>
-      <ul id="queue-list" class="queue-list"></ul>
-    </section>
-
-    <div id="status" class="status"></div>
-  </main>
+    <footer class="statusbar">
+      <span class="live-dot" aria-hidden="true"></span>
+      <p id="status" class="status"></p>
+    </footer>
+  </div>
   <script type="module" src="/main.js"></script>
 </body>
 

@@ -22,6 +22,14 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[derive(Default)]
 pub struct DownloadRegistry(pub Mutex<HashMap<String, Child>>);
 
+/// Tiến trình bgutil PO Token provider server (node, port 4416) — khởi động
+/// khi app chạy, dọn sạch khi app thoát. Cho yt-dlp xin PO Token qua HTTP
+/// để client `web` trả format tới 1080p trên tài khoản bị ép SABR.
+#[derive(Default)]
+pub struct PotServerState(pub Mutex<Option<Child>>);
+
+const POT_ENDPOINT: &str = "127.0.0.1:4416";
+
 /// Tìm binary theo thứ tự ưu tiên:
 /// 1. Resource dir của bản build đã đóng gói (binaries/<name>.exe, khai báo trong tauri.conf.json)
 /// 2. Cạnh exe của app (tiện cho dev: đặt thủ công vào target/debug)
@@ -122,9 +130,190 @@ pub async fn check_yt_dlp(app: AppHandle) -> Result<String, String> {
     .await
 }
 
-fn fetch_metadata(bin: &PathBuf, url: &str) -> Result<serde_json::Value, String> {
-    let out = base_command(bin)
-        .args(["-j", "--no-playlist", "--no-warnings", url])
+/// yt-dlp cập nhật liên tục để theo kịp các thay đổi chống bot của YouTube,
+/// bản bundle đi kèm app có thể đã cũ → tự cập nhật bằng --update của nó.
+/// Chỉ hoạt động với bản yt-dlp đóng gói tự chạy (exe/macos); bản cài qua pip
+/// sẽ trả về Err với hướng dẫn pip install -U yt-dlp.
+#[tauri::command]
+pub async fn update_yt_dlp(app: AppHandle) -> Result<String, String> {
+    run_blocking(move || {
+        let bin = resolve_binary(&app, "yt-dlp")?;
+        let out = base_command(&bin)
+            .arg("--update")
+            .output()
+            .map_err(|e| e.to_string())?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .trim()
+        .to_string();
+        if out.status.success() {
+            Ok(text)
+        } else {
+            Err(format!("Cập nhật yt-dlp thất bại: {text}"))
+        }
+    })
+    .await
+}
+
+/// Thư mục chứa plugin PO Token provider (bgutil-ytdlp-pot-provider), nằm
+/// cạnh yt-dlp: <dir yt-dlp>/plugins. Cấu trúc chuẩn: plugins/<tên>/
+/// yt_dlp_plugins/<category>/<file>.py (đây là đường dẫn truyền vào
+/// --plugin-dirs của yt-dlp).
+fn resolve_plugins_dir(yt_dlp: &PathBuf) -> Option<PathBuf> {
+    let dir = yt_dlp.parent()?.join("plugins");
+    let candidate = dir.join("bgutil-ytdlp-pot-provider");
+    (candidate.is_dir()).then_some(dir)
+}
+
+/// Thư mục bgutil provider server (build/main.js + node_modules) cạnh yt-dlp.
+fn resolve_server_dir(app: &AppHandle, yt_dlp: &PathBuf) -> Option<PathBuf> {
+    if let Some(dir) = yt_dlp.parent() {
+        let candidate = dir.join("bgutil-provider");
+        if candidate.join("build").join("main.js").is_file() {
+            return Some(candidate);
+        }
+    }
+    let candidate = app
+        .path()
+        .resolve("binaries/bgutil-provider", BaseDirectory::Resource)
+        .ok()?;
+    if candidate.join("build").join("main.js").is_file() {
+        return Some(candidate);
+    }
+    None
+}
+
+fn pot_server_reachable() -> bool {
+    use std::net::TcpStream;
+    TcpStream::connect(POT_ENDPOINT)
+        .map(|s| {
+            drop(s);
+            true
+        })
+        .unwrap_or(false)
+}
+
+/// Đảm bảo bgutil provider server đang chạy (spawn nếu rỗng, chờ port mở
+/// tối đa ~8 giây). Trả về true nếu plugin có thể xin PO Token qua HTTP.
+fn ensure_pot_server(app: &AppHandle, yt_dlp: &PathBuf) -> bool {
+    if pot_server_reachable() {
+        // Server có thể do app cũ nơi khác hoặc chạy thủ công — cứ dùng.
+        return true;
+    }
+    if !which::which("node").is_ok() {
+        return false;
+    }
+    let Some(server_dir) = resolve_server_dir(app, yt_dlp) else {
+        return false;
+    };
+
+    let state = app.state::<PotServerState>();
+    let mut guard = state.0.lock().unwrap();
+    if guard.is_some() {
+        // Đã spawn app-launch nhưng chưa kịp nghe port -> chờ thêm đã.
+        return wait_pot_ready_guarded(&guard);
+    }
+    let node_bin = PathBuf::from("node");
+    let mut cmd = base_command(&node_bin);
+    cmd.current_dir(&server_dir);
+    cmd.arg("build").arg("main.js");
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    match cmd.spawn() {
+        Ok(child) => {
+            *guard = Some(child);
+            wait_pot_ready_guarded(&guard)
+        }
+        Err(_) => false,
+    }
+}
+
+fn wait_pot_ready_guarded(_child: &Option<Child>) -> bool {
+    for _ in 0..40 {
+        if pot_server_reachable() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    false
+}
+
+/// Kill server PO Token khi app thoát.
+pub fn kill_pot_server(state: &PotServerState) {
+    if let Some(mut child) = state.0.lock().unwrap().take() {
+        kill_process_tree(&mut child);
+    }
+}
+
+/// Video giới hạn tuổi / tài khoản bị YouTube ép SABR (bỏ stream URL truyền
+/// thống): các client web trả về có mỗi storyboard, không tải được. Nghiệm
+/// pháp đã kiểm chứng (yt-dlp SABR fork + cookies):
+/// - Có PO Token provider: client tv,web + formats=duplicate → TV fallback
+///   chắc chắn có (360-720p), web mở khoá SABR tới 1080p+ qua PO Token.
+/// - Không có: ép player_client=tv để lấy format trực tiếp (tới ~720p).
+/// --js-runtimes node để giải n-challenge (node được dò theo PATH; yt-dlp
+/// mặc định chỉ tìm deno).
+fn add_youtube_fixes(
+    cmd: &mut Command,
+    has_cookies: bool,
+    plugins_dir: Option<&PathBuf>,
+    pot_enabled: bool,
+) {
+    if which::which("node").is_ok() {
+        cmd.args(["--js-runtimes", "node"]);
+    }
+    if let Some(dir) = plugins_dir {
+        cmd.arg("--plugin-dirs");
+        cmd.arg(dir);
+    }
+    if pot_enabled {
+        cmd.args(["--extractor-args", "youtube:player_client=tv,web;formats=duplicate"]);
+    } else if has_cookies {
+        cmd.args(["--extractor-args", "youtube:player_client=tv"]);
+    }
+}
+
+/// YouTube/TikTok chặn request không có đăng nhập ("Sign in to confirm you're
+/// not a bot") — yt-dlp khắc phục bằng cách mượn cookies của trình duyệt.
+/// Ưu tiên file cookies.txt (--cookies) nếu được cung cấp: Chrome/Edge 127+
+/// mã hoá cookies kiểu App-Bound khiến --cookies-from-browser thất bại vì
+/// DPAPI (và DB của trình duyệt đang mở cũng bị khoá), file là cách chắc chắn.
+/// Chỉ cho phép một trong hai phía trên — yt-dlp không nhận cả hai cùng lúc.
+fn add_cookies_args(
+    cmd: &mut Command,
+    cookies_from_browser: Option<&str>,
+    cookies_file: Option<&str>,
+) -> bool {
+    let file = cookies_file.map(str::trim).filter(|f| !f.is_empty());
+    let browser = cookies_from_browser
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+
+    let has_cookies = file.is_some() || browser.is_some();
+    if let Some(f) = file {
+        cmd.args(["--cookies", f]);
+    } else if let Some(b) = browser {
+        cmd.args(["--cookies-from-browser", b]);
+    }
+    has_cookies
+}
+
+fn fetch_metadata(
+    bin: &PathBuf,
+    url: &str,
+    cookies_from_browser: Option<&str>,
+    cookies_file: Option<&str>,
+    plugins_dir: Option<PathBuf>,
+    pot_enabled: bool,
+) -> Result<serde_json::Value, String> {
+    let mut cmd = base_command(bin);
+    cmd.args(["-j", "--no-playlist", "--no-warnings"]);
+    let has_cookies = add_cookies_args(&mut cmd, cookies_from_browser, cookies_file);
+    add_youtube_fixes(&mut cmd, has_cookies, plugins_dir.as_ref(), pot_enabled);
+    cmd.arg(url);
+    let out = cmd
         .output()
         .map_err(|e| e.to_string())?;
 
@@ -136,31 +325,50 @@ fn fetch_metadata(bin: &PathBuf, url: &str) -> Result<serde_json::Value, String>
     serde_json::from_slice(&out.stdout).map_err(|e| format!("Parse JSON lỗi: {e}"))
 }
 
-/// Dò nhanh xem URL có phải playlist không, dùng --flat-playlist để không tải metadata từng video.
-fn detect_playlist(bin: &PathBuf, url: &str) -> (bool, Option<i64>) {
-    let out = base_command(bin)
-        .args(["-J", "--flat-playlist", "--no-warnings", url])
-        .output();
+/// Dò nhanh xem URL có phải playlist không, dùng --flat-playlist để không tải
+/// metadata từng video (video trong playlist sẽ được truy cập riêng lúc tải).
+/// Với URL thuần playlist, lệnh -j thường sẽ quét từng video (chậm, dễ chết
+/// theo mạng) — nên JSON của lệnh này cũng được dùng làm metadata thay thế
+/// khi metadata single-video thất bại.
+fn detect_playlist(
+    bin: &PathBuf,
+    url: &str,
+    cookies_from_browser: Option<&str>,
+    cookies_file: Option<&str>,
+    plugins_dir: Option<PathBuf>,
+    pot_enabled: bool,
+) -> Option<serde_json::Value> {
+    let mut cmd = base_command(bin);
+    cmd.args(["-J", "--flat-playlist", "--no-warnings"]);
+    let has_cookies = add_cookies_args(&mut cmd, cookies_from_browser, cookies_file);
+    add_youtube_fixes(&mut cmd, has_cookies, plugins_dir.as_ref(), pot_enabled);
+    cmd.arg(url);
+    let out = cmd.output();
 
     let Ok(out) = out else {
-        return (false, None);
+        return None;
     };
     if !out.status.success() {
-        return (false, None);
+        return None;
     }
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-        return (false, None);
-    };
-
-    match json.get("entries").and_then(|e| e.as_array()) {
-        Some(entries) if entries.len() > 1 => (true, Some(entries.len() as i64)),
-        _ => (false, None),
-    }
+    serde_json::from_slice::<serde_json::Value>(&out.stdout).ok()
 }
 
 #[tauri::command]
-pub async fn fetch_info(app: AppHandle, url: String) -> Result<VideoInfo, String> {
+pub async fn fetch_info(
+    app: AppHandle,
+    url: String,
+    cookies_from_browser: Option<String>, // tên trình duyệt để mượn cookies, rỗng/None = không dùng
+    cookies_file: Option<String>, // đường dẫn file cookies.txt (định dạng Netscape) để xuất bypass DPAPI
+) -> Result<VideoInfo, String> {
+    let app2 = app.clone();
     let bin = run_blocking(move || resolve_binary(&app, "yt-dlp")).await?;
+    // Đảm bảo bgutil PO Token provider server đang chạy (spawn 1 lần) rồi
+    // nhìn thư mục plugin để truyền --plugin-dirs cho yt-dlp.
+    let plugins_bin = bin.clone();
+    let _ = run_blocking(move || Ok(ensure_pot_server(&app2, &plugins_bin))).await;
+    let plugins_dir = resolve_plugins_dir(&bin);
+    let pot_enabled = plugins_dir.is_some() && pot_server_reachable();
 
     // Hai lệnh yt-dlp (metadata single-video + dò playlist) chạy song song
     // trên 2 thread riêng thay vì tuần tự, để giảm ~50% thời gian chờ mạng.
@@ -168,20 +376,70 @@ pub async fn fetch_info(app: AppHandle, url: String) -> Result<VideoInfo, String
     // hai trước rồi mới await tuần tự vẫn cho concurrency thật sự.
     let bin1 = bin.clone();
     let url1 = url.clone();
-    let metadata_handle =
-        tauri::async_runtime::spawn_blocking(move || fetch_metadata(&bin1, &url1));
+    let cookies1 = cookies_from_browser.clone();
+    let file1 = cookies_file.clone();
+    let plugins1 = plugins_dir.clone();
+    let metadata_handle = tauri::async_runtime::spawn_blocking(move || {
+        fetch_metadata(
+            &bin1,
+            &url1,
+            cookies1.as_deref(),
+            file1.as_deref(),
+            plugins1,
+            pot_enabled,
+        )
+    });
 
     let bin2 = bin.clone();
-    let url2 = url.clone();
-    let playlist_handle =
-        tauri::async_runtime::spawn_blocking(move || detect_playlist(&bin2, &url2));
+    let cookies2 = cookies_from_browser.clone();
+    let file2 = cookies_file.clone();
+    let playlist_handle = tauri::async_runtime::spawn_blocking(move || {
+        detect_playlist(
+            &bin2,
+            &url,
+            cookies2.as_deref(),
+            file2.as_deref(),
+            plugins_dir,
+            pot_enabled,
+        )
+    });
 
-    let json = metadata_handle
-        .await
-        .map_err(|e| format!("Lỗi nội bộ (task panic): {e}"))??;
-    let (is_playlist, playlist_count) = playlist_handle
-        .await
+    let meta_result: Result<serde_json::Value, String> = match metadata_handle.await {
+        Ok(r) => r,
+        Err(e) => Err(format!("Lỗi nội bộ (task panic): {e}")),
+    };
+    let playlist_json = playlist_handle.await.unwrap_or(None);
+
+    let (is_playlist, playlist_count) = playlist_json
+        .as_ref()
+        .and_then(|j| j.get("entries"))
+        .and_then(|e| e.as_array())
+        .map(|arr| (arr.len() > 0, Some(arr.len() as i64)))
         .unwrap_or((false, None));
+
+    // Fallback riêng biệt: nếu URL là playlist thuần, -j metadata sẽ trả lỗi
+    // quét từng video; dùng JSON của -J --flat-playlist thay thế (title của
+    // playlist, không có format/conver/ duration của từng video bên trong).
+    let json = match meta_result {
+        Ok(j) => {
+            if j.get("_type").and_then(|t| t.as_str()) == Some("playlist") {
+                playlist_json.clone().unwrap_or(j)
+            } else {
+                j
+            }
+        }
+        Err(e) => {
+            if let Some(pj) = playlist_json.clone() {
+                if is_playlist {
+                    pj
+                } else {
+                    return Err(e);
+                }
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     // Rút danh sách độ phân giải khả dụng (duy nhất, giảm dần) để hiện dropdown chất lượng.
     let mut heights: Vec<i64> = json
@@ -255,9 +513,31 @@ pub async fn download_video(
     quality: String,       // "best" | "audio" | "1080" | "720" | "480" | "360" ...
     is_playlist: bool,     // true nếu người dùng muốn tải cả playlist
     filename_template: Option<String>, // cú pháp output template của yt-dlp, không kèm thư mục
+    cookies_from_browser: Option<String>, // tên trình duyệt để mượn cookies (chrome/edge/firefox/...)
+    cookies_file: Option<String>, // đường dẫn file cookies.txt, sạch hơn và bypass lỗi DPAPI
+    playlist_items: Option<String>, // dải item playlist theo cú pháp yt-dlp: "1-5,8,12-"
+    write_subs: bool,      // tải subtitle (vi/en + auto caption) và --convert-subs srt
+    subs_embed: bool,      // --embed-subs ghép phụ đề vào file video
+    embed_metadata: bool,  // --embed-thumbnail + --embed-metadata + --embed-chapters
+    use_archive: bool,     // --download-archive: bỏ qua item đã từng tải xong
 ) -> Result<(), String> {
     run_blocking(move || {
-        run_download_blocking(app, id, url, out_dir, quality, is_playlist, filename_template)
+        run_download_blocking(
+            app,
+            id,
+            url,
+            out_dir,
+            quality,
+            is_playlist,
+            filename_template,
+            cookies_from_browser,
+            cookies_file,
+            playlist_items,
+            write_subs,
+            subs_embed,
+            embed_metadata,
+            use_archive,
+        )
     })
     .await
 }
@@ -271,8 +551,18 @@ fn run_download_blocking(
     quality: String,
     is_playlist: bool,
     filename_template: Option<String>,
+    cookies_from_browser: Option<String>,
+    cookies_file: Option<String>,
+    playlist_items: Option<String>,
+    write_subs: bool,
+    subs_embed: bool,
+    embed_metadata: bool,
+    use_archive: bool,
 ) -> Result<(), String> {
     let bin = resolve_binary(&app, "yt-dlp")?;
+    ensure_pot_server(&app, &bin);
+    let plugins_dir = resolve_plugins_dir(&bin);
+    let pot_enabled = plugins_dir.is_some() && pot_server_reachable();
     let ffmpeg_path = resolve_binary(&app, "ffmpeg").ok();
     let registry = app.state::<DownloadRegistry>();
 
@@ -289,6 +579,8 @@ fn run_download_blocking(
 
     let mut cmd = base_command(&bin);
     cmd.args(["--newline", "--no-warnings", "-o", &out_template]);
+    let has_cookies = add_cookies_args(&mut cmd, cookies_from_browser.as_deref(), cookies_file.as_deref());
+    add_youtube_fixes(&mut cmd, has_cookies, plugins_dir.as_ref(), pot_enabled);
 
     if let Some(ffmpeg) = &ffmpeg_path {
         // Chỉ cần khi ffmpeg không có sẵn trong PATH của máy người dùng —
@@ -299,8 +591,42 @@ fn run_download_blocking(
 
     if is_playlist {
         cmd.arg("--yes-playlist");
+        // Dải video cụ thể muốn tải (nếu người dùng nhập) — cú pháp yt-dlp:
+        // "1" / "1-5" / "12-" / "1-5,8,12-" — để trống là tải toàn bộ.
+        if let Some(items) = playlist_items
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            cmd.args(["--playlist-items", &items]);
+        }
     } else {
         cmd.arg("--no-playlist");
+    }
+
+    if write_subs {
+        // Phụ đề thủ công lẫn auto-caption, ưu tiên tiếng Việt rồi tiếng Anh,
+        // convert sang srt để dễ embed/phát lại.
+        cmd.args([
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs",
+            "vi.*,vi,en.*,en",
+            "--convert-subs",
+            "srt",
+        ]);
+    }
+    if subs_embed {
+        cmd.arg("--embed-subs");
+    }
+    if embed_metadata {
+        cmd.args(["--embed-metadata", "--embed-chapters", "--embed-thumbnail"]);
+    }
+    if use_archive {
+        // File archive chỉ mang tính cục bộ trong thư mục hiện tại — yt-dlp
+        // dùng nó để nhận diện như video đã tải xong rồi bỏ qua khi lặp lại.
+        let archive = PathBuf::from(&out_dir).join("ytflash-archive.txt");
+        cmd.arg("--download-archive");
+        cmd.arg(&archive);
     }
 
     if quality == "audio" {

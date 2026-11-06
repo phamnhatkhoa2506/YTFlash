@@ -8,8 +8,16 @@ const addQueueBtn = document.getElementById("add-queue-btn");
 const downloadBtn = document.getElementById("download-btn");
 const chooseDirBtn = document.getElementById("choose-dir-btn");
 const outDirLabel = document.getElementById("out-dir");
+const chooseCookiesBtn = document.getElementById("choose-cookies-btn");
+const cookieFileLabel = document.getElementById("cookies-file");
 const qualitySelect = document.getElementById("quality-select");
+const browserSelect = document.getElementById("browser-select");
 const filenameTemplateInput = document.getElementById("filename-template");
+const playlistItemsInput = document.getElementById("playlist-items");
+const optSubs = document.getElementById("opt-subs");
+const optSubsEmbed = document.getElementById("opt-subs-embed");
+const optEmbed = document.getElementById("opt-embed");
+const optArchive = document.getElementById("opt-archive");
 
 const infoCard = document.getElementById("info-card");
 const infoThumb = document.getElementById("info-thumb");
@@ -21,16 +29,45 @@ const playlistToggle = document.getElementById("playlist-toggle");
 
 const startQueueBtn = document.getElementById("start-queue-btn");
 const queueListEl = document.getElementById("queue-list");
+const queueCountEl = document.getElementById("queue-count");
+const queueEmptyEl = document.getElementById("queue-empty");
 const statusEl = document.getElementById("status");
+const updateDlpBtn = document.getElementById("update-dlp-btn");
 
 let outDir = null;
+let cookieFile = null;
 let currentInfo = null; // { url, title, thumbnail, is_playlist, playlist_count }
 let queue = []; // { id, url, title, outDir, quality, isPlaylist, filenameTemplate, status, percent, speed, eta, message }
 let isProcessingQueue = false;
 
 function setStatus(msg, isError = false) {
   statusEl.textContent = msg;
-  statusEl.style.color = isError ? "#e5484d" : "";
+  statusEl.title = msg;
+  statusEl.classList.toggle("is-error", isError);
+  statusEl.parentElement?.classList.toggle("is-error", isError);
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+// YouTube báo "Sign in to confirm your age / you're not a bot" khi request
+// không có cookies — hướng dẫn người dùng chọn trình duyệt ở ô "Xác thực".
+function applyErrorHint(msg) {
+  let hint =
+    "Lưu ý: nếu là video YouTube giới hạn tuổi, chọn trình duyệt ở ô 'Xác thực (cookies)' rồi Kiểm tra lại.";
+  if (/failed to decrypt|dpapi|could not copy/i.test(msg)) {
+    hint =
+      "Trình duyệt mã hoá cookies kiểu mới (Chrome/Edge 127+), yt-dlp không đọc nổi. Cách chắc chắn: bên cạnh ô Cookies.txt, cài extension 'Get cookies.txt' → xuất file cookies.txt cho youtube.com → bấm nút Cookies.txt… để chọn file đó.";
+  } else if (/sign in to confirm|not a bot|age|cookies/i.test(msg)) {
+    hint =
+      "Lưu ý: chọn trình duyệt bạn đã đăng nhập ở ô 'Xác thực (cookies từ trình duyệt)' rồi Kiểm tra lại. Nếu vẫn lỗi (Chrome/Edge mã hoá cookies DPAPI), hãy dùng file cookies.txt qua nút Cookies.txt…";
+  }
+  setStatus(`${msg} — ${hint}`, true);
 }
 
 function resetQualityOptions() {
@@ -57,6 +94,20 @@ function updateActionButtons() {
   downloadBtn.disabled = !(hasInfo && outDir);
 }
 
+// Phụ đề chỉ có ý nghĩa khi tải file video (mp3 thì chỉ tải .srt riêng).
+function syncOptState() {
+  const isAudio = qualitySelect.value === "audio";
+  optSubsEmbed.disabled = isAudio || !optSubs.checked;
+  if (optSubsEmbed.disabled) optSubsEmbed.checked = false;
+}
+
+qualitySelect.addEventListener("change", syncOptState);
+optSubs.addEventListener("change", syncOptState);
+
+urlInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") fetchBtn.click();
+});
+
 fetchBtn.addEventListener("click", async () => {
   const url = urlInput.value.trim();
   if (!url) return;
@@ -65,7 +116,11 @@ fetchBtn.addEventListener("click", async () => {
   infoCard.classList.add("hidden");
   updateActionButtons();
   try {
-    const info = await invoke("fetch_info", { url });
+    const info = await invoke("fetch_info", {
+      url,
+      cookiesFromBrowser: browserSelect.value || null,
+      cookiesFile: cookieFile,
+    });
     currentInfo = { url, ...info };
 
     infoTitle.textContent = info.title;
@@ -88,9 +143,25 @@ fetchBtn.addEventListener("click", async () => {
 
     infoCard.classList.remove("hidden");
     updateActionButtons();
-    setStatus("Sẵn sàng tải.");
+    let readyMsg = "Sẵn sàng tải.";
+    const auth = [];
+    if (cookieFile) auth.push("cookies.txt");
+    if (browserSelect.value) auth.push(browserSelect.value);
+    if (auth.length) readyMsg = `Cookies từ ${auth.join(" + ")}. ${readyMsg}`;
+    setStatus(readyMsg);
   } catch (e) {
-    setStatus(String(e), true);
+    applyErrorHint(String(e));
+  }
+});
+
+chooseCookiesBtn.addEventListener("click", async () => {
+  const file = await open({
+    multiple: false,
+    filters: [{ name: "Cookies.txt", extensions: ["txt", "sqlite"] }],
+  });
+  if (file) {
+    cookieFile = file.path || file;
+    cookieFileLabel.textContent = cookieFile;
   }
 });
 
@@ -111,6 +182,13 @@ function currentSettingsSnapshot() {
     quality: qualitySelect.value,
     isPlaylist: currentInfo.is_playlist && playlistToggle.checked,
     filenameTemplate: filenameTemplateInput.value.trim() || null,
+    cookiesFromBrowser: browserSelect.value || null,
+    cookiesFile: cookieFile,
+    playlistItems: playlistItemsInput.value.trim() || null,
+    writeSubs: optSubs.checked,
+    subsEmbed: optSubs.checked && optSubsEmbed.checked,
+    embedMetadata: optEmbed.checked,
+    useArchive: optArchive.checked,
   };
 }
 
@@ -149,29 +227,43 @@ startQueueBtn.addEventListener("click", () => {
 
 function renderQueue() {
   queueListEl.innerHTML = "";
+  if (queueCountEl) queueCountEl.textContent = String(queue.length);
+  if (queueEmptyEl) queueEmptyEl.hidden = queue.length > 0;
   for (const item of queue) {
     const li = document.createElement("li");
     li.className = `queue-item status-${item.status}`;
     li.dataset.id = item.id;
 
     const badge = {
-      pending: "⏳ Chờ",
-      downloading: "⬇️ Đang tải",
-      merging: "🔧 Đang ghép",
-      done: "✅ Xong",
-      error: "❌ Lỗi",
-      canceled: "🚫 Đã hủy",
+      pending: "Chờ",
+      downloading: "Đang tải",
+      merging: "Đang ghép",
+      done: "Xong",
+      error: "Lỗi",
+      canceled: "Đã hủy",
     }[item.status];
+
+    const qualityLabel =
+      item.quality === "audio" ? "MP3" : item.quality === "best" ? "MP4 tốt nhất" : `${item.quality}p`;
+    const meta = [
+      qualityLabel,
+      item.isPlaylist ? "Playlist" : null,
+      item.playlistItems ? `mục ${item.playlistItems}` : null,
+      item.writeSubs ? (item.subsEmbed ? "phụ đề nhúng" : "phụ đề srt") : null,
+      item.embedMetadata ? "thumbnail" : null,
+      item.useArchive ? "archive" : null,
+      item.cookiesFile ? "cookies.txt" : null,
+      item.cookiesFromBrowser || null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
 
     li.innerHTML = `
       <div class="queue-row-top">
-        <span class="queue-title" title="${item.url}">${item.title}</span>
+        <span class="queue-title" title="${escapeHtml(item.url)}">${escapeHtml(item.title)}</span>
         <span class="queue-badge">${badge}</span>
       </div>
-      <div class="queue-row-meta">
-        ${item.quality === "audio" ? "🎵 mp3" : `🎞 ${item.quality === "best" ? "tốt nhất" : item.quality + "p"}`}
-        ${item.isPlaylist ? " · playlist" : ""}
-      </div>
+      <div class="queue-row-meta">${escapeHtml(meta)}</div>
       <div class="progress-bar"><div class="progress-fill" style="width:${item.percent}%"></div></div>
       <div class="queue-row-bottom">
         <span class="queue-progress-label">${queueProgressLabel(item)}</span>
@@ -250,6 +342,13 @@ async function processQueue() {
         quality: item.quality,
         isPlaylist: item.isPlaylist,
         filenameTemplate: item.filenameTemplate,
+        cookiesFromBrowser: item.cookiesFromBrowser,
+        cookiesFile: item.cookiesFile,
+        playlistItems: item.playlistItems,
+        writeSubs: item.writeSubs,
+        subsEmbed: item.subsEmbed,
+        embedMetadata: item.embedMetadata,
+        useArchive: item.useArchive,
       });
       item.status = "done";
       item.percent = 100;
@@ -257,6 +356,7 @@ async function processQueue() {
       const msg = String(e);
       item.status = msg.includes("Đã hủy") ? "canceled" : "error";
       item.message = msg;
+      applyErrorHint(msg);
     }
     renderQueue();
   }
@@ -280,6 +380,26 @@ listen("download-progress", (event) => {
   // tránh race giữa event cuối cùng và kết quả trả về của invoke.
 
   updateQueueItemDom(item);
+});
+
+updateDlpBtn.addEventListener("click", async () => {
+  updateDlpBtn.disabled = true;
+  setStatus("Đang cập nhật yt-dlp...");
+  try {
+    const result = await invoke("update_yt_dlp");
+    if (/already up-to-date|updated/i.test(result)) {
+      setStatus(result);
+    } else {
+      setStatus(result);
+    }
+  } catch (e) {
+    setStatus(String(e), true);
+  } finally {
+    invoke("check_yt_dlp")
+      .then((v) => setStatus(`yt-dlp ${v} sẵn sàng.`))
+      .catch(() => {});
+    updateDlpBtn.disabled = false;
+  }
 });
 
 // Kiểm tra yt-dlp có sẵn không khi khởi động
