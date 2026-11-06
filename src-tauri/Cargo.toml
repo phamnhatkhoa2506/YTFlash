@@ -1,6 +1,6 @@
 [package]
 name = "ytflash"
-version = "0.2.0"
+version = "0.2.1"
 description = "Tải video YouTube/TikTok/Instagram trực tiếp, không qua web trung gian"
 authors = ["khoap"]
 edition = "2021"
@@ -34,3 +34,4 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+

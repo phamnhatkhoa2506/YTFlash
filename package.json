@@ -1,7 +1,7 @@
 {
   "name": "ytflash",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "scripts": {
     "tauri": "tauri"
@@ -14,3 +14,4 @@
     "@tauri-apps/plugin-dialog": "^2.7.3"
   }
 }
+

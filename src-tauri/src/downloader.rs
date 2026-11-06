@@ -255,11 +255,14 @@ pub fn kill_pot_server(state: &PotServerState) {
 /// - Không có: ép player_client=tv để lấy format trực tiếp (tới ~720p).
 /// --js-runtimes node để giải n-challenge (node được dò theo PATH; yt-dlp
 /// mặc định chỉ tìm deno).
+/// Một số video client `tv` trả về response player cũ của YouTube
+/// ("The page needs to be reloaded") — khi đó bỏ tv và thử lại chỉ với web.
 fn add_youtube_fixes(
     cmd: &mut Command,
     has_cookies: bool,
     plugins_dir: Option<&PathBuf>,
     pot_enabled: bool,
+    client_override: Option<&str>,
 ) {
     if which::which("node").is_ok() {
         cmd.args(["--js-runtimes", "node"]);
@@ -269,9 +272,14 @@ fn add_youtube_fixes(
         cmd.arg(dir);
     }
     if pot_enabled {
-        cmd.args(["--extractor-args", "youtube:player_client=tv,web;formats=duplicate"]);
+        let clients = client_override.unwrap_or("tv,web");
+        cmd.args([
+            "--extractor-args",
+            &format!("youtube:player_client={clients};formats=duplicate"),
+        ]);
     } else if has_cookies {
-        cmd.args(["--extractor-args", "youtube:player_client=tv"]);
+        let clients = client_override.unwrap_or("tv");
+        cmd.args(["--extractor-args", &format!("youtube:player_client={clients}")]);
     }
 }
 
@@ -308,21 +316,35 @@ fn fetch_metadata(
     plugins_dir: Option<PathBuf>,
     pot_enabled: bool,
 ) -> Result<serde_json::Value, String> {
-    let mut cmd = base_command(bin);
-    cmd.args(["-j", "--no-playlist", "--no-warnings"]);
-    let has_cookies = add_cookies_args(&mut cmd, cookies_from_browser, cookies_file);
-    add_youtube_fixes(&mut cmd, has_cookies, plugins_dir.as_ref(), pot_enabled);
-    cmd.arg(url);
-    let out = cmd
-        .output()
-        .map_err(|e| e.to_string())?;
+    let duplicate_fixes =
+        |cmd: &mut Command, client_override: Option<&str>| -> Result<serde_json::Value, String> {
+            cmd.args(["-j", "--no-playlist", "--no-warnings"]);
+            let has_cookies = add_cookies_args(cmd, cookies_from_browser, cookies_file);
+            add_youtube_fixes(cmd, has_cookies, plugins_dir.as_ref(), pot_enabled, client_override);
+            cmd.arg(url);
+            let out = cmd.output().map_err(|e| e.to_string())?;
 
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("yt-dlp lỗi: {err}"));
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                return Err(format!("yt-dlp lỗi: {err}"));
+            }
+
+            serde_json::from_slice(&out.stdout).map_err(|e| format!("Parse JSON lỗi: {e}"))
+        };
+
+    let mut first = base_command(bin);
+    match duplicate_fixes(&mut first, None) {
+        Ok(json) => Ok(json),
+        Err(e) => {
+            // Client tv trả stale response → thử lại chỉ với web (cần PO Token).
+            if e.contains("The page needs to be reloaded") && pot_enabled {
+                let mut retry = base_command(bin);
+                duplicate_fixes(&mut retry, Some("web"))
+            } else {
+                Err(e)
+            }
+        }
     }
-
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("Parse JSON lỗi: {e}"))
 }
 
 /// Dò nhanh xem URL có phải playlist không, dùng --flat-playlist để không tải
@@ -341,7 +363,7 @@ fn detect_playlist(
     let mut cmd = base_command(bin);
     cmd.args(["-J", "--flat-playlist", "--no-warnings"]);
     let has_cookies = add_cookies_args(&mut cmd, cookies_from_browser, cookies_file);
-    add_youtube_fixes(&mut cmd, has_cookies, plugins_dir.as_ref(), pot_enabled);
+    add_youtube_fixes(&mut cmd, has_cookies, plugins_dir.as_ref(), pot_enabled, None);
     cmd.arg(url);
     let out = cmd.output();
 
@@ -577,168 +599,194 @@ fn run_download_blocking(
         });
     let out_template = format!("{out_dir}/{template}");
 
-    let mut cmd = base_command(&bin);
-    cmd.args(["--newline", "--no-warnings", "-o", &out_template]);
-    let has_cookies = add_cookies_args(&mut cmd, cookies_from_browser.as_deref(), cookies_file.as_deref());
-    add_youtube_fixes(&mut cmd, has_cookies, plugins_dir.as_ref(), pot_enabled);
+    // Lần 1: cấu hình chuẩn (client tv,web khi có PO Token). Nếu client tv
+    // trả về "The page needs to be reloaded" (response player cũ của YouTube),
+    // lần 2 thử lại chỉ với client web — video dạng đó thường tải được qua web.
+    let attempts: [Option<&str>; 2] = [None, Some("web")];
+    for client_override in attempts {
+        let mut cmd = base_command(&bin);
+        cmd.args(["--newline", "--no-warnings", "-o", &out_template]);
+        let has_cookies = add_cookies_args(&mut cmd, cookies_from_browser.as_deref(), cookies_file.as_deref());
+        add_youtube_fixes(&mut cmd, has_cookies, plugins_dir.as_ref(), pot_enabled, client_override);
 
-    if let Some(ffmpeg) = &ffmpeg_path {
-        // Chỉ cần khi ffmpeg không có sẵn trong PATH của máy người dùng —
-        // trỏ thẳng tới bản đã bundle cùng app để mux mp4 hoạt động độc lập.
-        cmd.arg("--ffmpeg-location");
-        cmd.arg(ffmpeg);
-    }
+        if let Some(ffmpeg) = &ffmpeg_path {
+            // Chỉ cần khi ffmpeg không có sẵn trong PATH của máy người dùng —
+            // trỏ thẳng tới bản đã bundle cùng app để mux mp4 hoạt động độc lập.
+            cmd.arg("--ffmpeg-location");
+            cmd.arg(ffmpeg);
+        }
 
-    if is_playlist {
-        cmd.arg("--yes-playlist");
-        // Dải video cụ thể muốn tải (nếu người dùng nhập) — cú pháp yt-dlp:
-        // "1" / "1-5" / "12-" / "1-5,8,12-" — để trống là tải toàn bộ.
-        if let Some(items) = playlist_items
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        if is_playlist {
+            cmd.arg("--yes-playlist");
+            // Dải video cụ thể muốn tải (nếu người dùng nhập) — cú pháp yt-dlp:
+            // "1" / "1-5" / "12-" / "1-5,8,12-" — để trống là tải toàn bộ.
+            if let Some(items) = playlist_items
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                cmd.args(["--playlist-items", &items]);
+            }
+        } else {
+            cmd.arg("--no-playlist");
+        }
+
+        if write_subs {
+            // Phụ đề thủ công lẫn auto-caption, ưu tiên tiếng Việt rồi tiếng Anh,
+            // convert sang srt để dễ embed/phát lại.
+            cmd.args([
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs",
+                "vi.*,vi,en.*,en",
+                "--convert-subs",
+                "srt",
+            ]);
+        }
+        if subs_embed {
+            cmd.arg("--embed-subs");
+        }
+        if embed_metadata {
+            cmd.args(["--embed-metadata", "--embed-chapters", "--embed-thumbnail"]);
+        }
+        if use_archive {
+            // File archive chỉ mang tính cục bộ trong thư mục hiện tại — yt-dlp
+            // dùng nó để nhận diện như video đã tải xong rồi bỏ qua khi lặp lại.
+            let archive = PathBuf::from(&out_dir).join("ytflash-archive.txt");
+            cmd.arg("--download-archive");
+            cmd.arg(&archive);
+        }
+
+        if quality == "audio" {
+            cmd.args(["-x", "--audio-format", "mp3"]);
+        } else if let Some(args) = format_selector(&quality) {
+            cmd.args(args);
+        }
+
+        cmd.arg(&url);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| format!("Không khởi chạy được yt-dlp: {e}"))?;
+
+        let stdout = child.stdout.take().ok_or("Không lấy được stdout")?;
+        let stderr = child.stderr.take().ok_or("Không lấy được stderr")?;
+
+        // Lưu child vào registry để lệnh cancel_download có thể kill sau này.
+        registry.0.lock().unwrap().insert(id.clone(), child);
+
+        let progress_re =
+            Regex::new(r"\[download\]\s+(\d+(?:\.\d+)?)%.*?(?:at\s+(\S+))?.*?(?:ETA\s+(\S+))?")
+                .unwrap();
+
+        let app_out = app.clone();
+        let id_out = id.clone();
+        let out_handle = std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(caps) = progress_re.captures(&line) {
+                    let percent: f32 = caps
+                        .get(1)
+                        .and_then(|m| m.as_str().parse().ok())
+                        .unwrap_or(0.0);
+                    let speed = caps.get(2).map(|m| m.as_str().to_string());
+                    let eta = caps.get(3).map(|m| m.as_str().to_string());
+                    let _ = app_out.emit(
+                        "download-progress",
+                        ProgressEvent {
+                            id: id_out.clone(),
+                            percent,
+                            speed,
+                            eta,
+                            stage: "downloading".into(),
+                            message: None,
+                        },
+                    );
+                } else if line.contains("Merging formats") || line.contains("[Merger]") {
+                    let _ = app_out.emit(
+                        "download-progress",
+                        ProgressEvent {
+                            id: id_out.clone(),
+                            percent: 99.0,
+                            speed: None,
+                            eta: None,
+                            stage: "merging".into(),
+                            message: None,
+                        },
+                    );
+                }
+            }
+        });
+
+        let mut err_buf = String::new();
         {
-            cmd.args(["--playlist-items", &items]);
+            let mut reader = BufReader::new(stderr);
+            use std::io::Read;
+            let _ = reader.read_to_string(&mut err_buf);
         }
-    } else {
-        cmd.arg("--no-playlist");
-    }
 
-    if write_subs {
-        // Phụ đề thủ công lẫn auto-caption, ưu tiên tiếng Việt rồi tiếng Anh,
-        // convert sang srt để dễ embed/phát lại.
-        cmd.args([
-            "--write-subs",
-            "--write-auto-subs",
-            "--sub-langs",
-            "vi.*,vi,en.*,en",
-            "--convert-subs",
-            "srt",
-        ]);
-    }
-    if subs_embed {
-        cmd.arg("--embed-subs");
-    }
-    if embed_metadata {
-        cmd.args(["--embed-metadata", "--embed-chapters", "--embed-thumbnail"]);
-    }
-    if use_archive {
-        // File archive chỉ mang tính cục bộ trong thư mục hiện tại — yt-dlp
-        // dùng nó để nhận diện như video đã tải xong rồi bỏ qua khi lặp lại.
-        let archive = PathBuf::from(&out_dir).join("ytflash-archive.txt");
-        cmd.arg("--download-archive");
-        cmd.arg(&archive);
-    }
-
-    if quality == "audio" {
-        cmd.args(["-x", "--audio-format", "mp3"]);
-    } else if let Some(args) = format_selector(&quality) {
-        cmd.args(args);
-    }
-
-    cmd.arg(&url);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|e| format!("Không khởi chạy được yt-dlp: {e}"))?;
-
-    let stdout = child.stdout.take().ok_or("Không lấy được stdout")?;
-    let stderr = child.stderr.take().ok_or("Không lấy được stderr")?;
-
-    // Lưu child vào registry để lệnh cancel_download có thể kill sau này.
-    registry.0.lock().unwrap().insert(id.clone(), child);
-
-    let progress_re =
-        Regex::new(r"\[download\]\s+(\d+(?:\.\d+)?)%.*?(?:at\s+(\S+))?.*?(?:ETA\s+(\S+))?")
-            .unwrap();
-
-    let app_out = app.clone();
-    let id_out = id.clone();
-    let out_handle = std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(caps) = progress_re.captures(&line) {
-                let percent: f32 = caps
-                    .get(1)
-                    .and_then(|m| m.as_str().parse().ok())
-                    .unwrap_or(0.0);
-                let speed = caps.get(2).map(|m| m.as_str().to_string());
-                let eta = caps.get(3).map(|m| m.as_str().to_string());
-                let _ = app_out.emit(
-                    "download-progress",
-                    ProgressEvent {
-                        id: id_out.clone(),
-                        percent,
-                        speed,
-                        eta,
-                        stage: "downloading".into(),
-                        message: None,
-                    },
-                );
-            } else if line.contains("Merging formats") || line.contains("[Merger]") {
-                let _ = app_out.emit(
-                    "download-progress",
-                    ProgressEvent {
-                        id: id_out.clone(),
-                        percent: 99.0,
-                        speed: None,
-                        eta: None,
-                        stage: "merging".into(),
-                        message: None,
-                    },
-                );
+        // Chờ tiến trình kết thúc (thành công, lỗi, hoặc bị kill do cancel).
+        let status = {
+            let mut guard = registry.0.lock().unwrap();
+            match guard.get_mut(&id) {
+                Some(child) => child.wait(),
+                None => {
+                    // Đã bị cancel_download loại khỏi registry trước khi wait — coi như đã hủy.
+                    drop(guard);
+                    let _ = out_handle.join();
+                    let _ = app.emit(
+                        "download-progress",
+                        ProgressEvent {
+                            id: id.clone(),
+                            percent: 0.0,
+                            speed: None,
+                            eta: None,
+                            stage: "canceled".into(),
+                            message: None,
+                        },
+                    );
+                    return Err("Đã hủy tải".to_string());
+                }
             }
+        };
+        registry.0.lock().unwrap().remove(&id);
+        let status = status.map_err(|e| e.to_string())?;
+        let _ = out_handle.join();
+
+        if status.success() {
+            let _ = app.emit(
+                "download-progress",
+                ProgressEvent {
+                    id,
+                    percent: 100.0,
+                    speed: None,
+                    eta: None,
+                    stage: "done".into(),
+                    message: None,
+                },
+            );
+            return Ok(());
         }
-    });
 
-    let mut err_buf = String::new();
-    {
-        let mut reader = BufReader::new(stderr);
-        use std::io::Read;
-        let _ = reader.read_to_string(&mut err_buf);
-    }
-
-    // Chờ tiến trình kết thúc (thành công, lỗi, hoặc bị kill do cancel).
-    let status = {
-        let mut guard = registry.0.lock().unwrap();
-        match guard.get_mut(&id) {
-            Some(child) => child.wait(),
-            None => {
-                // Đã bị cancel_download loại khỏi registry trước khi wait — coi như đã hủy.
-                drop(guard);
-                let _ = out_handle.join();
-                let _ = app.emit(
-                    "download-progress",
-                    ProgressEvent {
-                        id: id.clone(),
-                        percent: 0.0,
-                        speed: None,
-                        eta: None,
-                        stage: "canceled".into(),
-                        message: None,
-                    },
-                );
-                return Err("Đã hủy tải".to_string());
-            }
+        // Client tv trả stale response → thử lại 1 lần chỉ với client web.
+        let should_retry = client_override.is_none()
+            && pot_enabled
+            && err_buf.contains("The page needs to be reloaded");
+        if should_retry {
+            let _ = app.emit(
+                "download-progress",
+                ProgressEvent {
+                    id: id.clone(),
+                    percent: 0.0,
+                    speed: None,
+                    eta: None,
+                    stage: "downloading".into(),
+                    message: Some("YouTube trả lỗi ở lần đầu — tự động thử lại bằng cấu hình khác…".into()),
+                },
+            );
+            continue;
         }
-    };
-    registry.0.lock().unwrap().remove(&id);
-    let status = status.map_err(|e| e.to_string())?;
-    let _ = out_handle.join();
 
-    if status.success() {
-        let _ = app.emit(
-            "download-progress",
-            ProgressEvent {
-                id,
-                percent: 100.0,
-                speed: None,
-                eta: None,
-                stage: "done".into(),
-                message: None,
-            },
-        );
-        Ok(())
-    } else {
         let _ = app.emit(
             "download-progress",
             ProgressEvent {
@@ -750,8 +798,9 @@ fn run_download_blocking(
                 message: Some(err_buf.clone()),
             },
         );
-        Err(format!("yt-dlp thất bại: {err_buf}"))
+        return Err(format!("yt-dlp thất bại: {err_buf}"));
     }
+    unreachable!("danh sách attempt không được rỗng")
 }
 
 #[tauri::command]
